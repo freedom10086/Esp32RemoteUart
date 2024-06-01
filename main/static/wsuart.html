@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Uart</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+        }
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        .header {
+            background-color: lightblue;
+            padding: 10px;
+            text-align: center;
+        }
+
+        .content {
+            flex: 1; /* This makes the div take up the remaining space */
+            overflow: auto; /* This will add scrollbars if the content overflows */
+            background-color: lightgray;
+            padding: 10px;
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body class="container">
+<div class="header">
+    <label>
+        tx:
+        <input id="tx_input" type="number" style="width: 25px;" value="4">
+    </label>
+    <label>
+        rx:
+        <input id="rx_input" type="number" style="width: 25px;" value="5">
+    </label>
+    <label>
+        speed
+        <input id="speed_input" type="number" style="width: 45px;" value="9600">
+    </label>
+
+    <button onclick="connect()">Connect</button>
+    <button onclick="disconnect()">Disconnect</button>
+</div>
+
+<div id="messages" class="content"></div>
+
+<script>
+    let socket;
+    let intervalId;
+    let isProcessing = false;
+
+    function connect() {
+        socket = new WebSocket("ws://192.168.4.1/ws");
+        socket.onopen = function (event) {
+            log("Connected to WebSocket server.");
+
+            // start uart
+            const url = new URL("http://192.168.4.1/uartconfig");
+            let params = {
+                speed: document.getElementById('speed_input').value,
+                tx: document.getElementById('tx_input').value,
+                rx: document.getElementById('rx_input').value,
+                stop: "0",
+                time: Math.round((new Date().getTime()) / 1000).toString(),
+            };
+            Object.keys(params).forEach(key => url.searchParams.append(key, params[key]));
+
+            fetch(url)
+                .then(response => response.text())
+                .then(data => {
+                    console.log(data);
+                    log("uart start:" + data);
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    log("uart start failed:", error)
+                });
+
+            if (intervalId) {
+                clearInterval(intervalId);
+                isProcessing = false;
+            }
+            intervalId = setInterval(requestData, 50);
+        };
+        socket.onmessage = function (event) {
+            console.log(event.data);
+            blobToBinaryArray(event.data)
+                .then(array => {
+                    console.log('Binary Array:', array);
+                    const hexString = Array.prototype.map.call(array, function (byte) {
+                        return ('0' + (byte & 0xFF).toString(16)).slice(-2);
+                    }).join(' ');
+
+                    log(hexString);
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                });
+
+            //log(event.data);
+        };
+        socket.onclose = function (event) {
+            log("Disconnected from WebSocket server.");
+            // start uart
+            const url = new URL("http://192.168.4.1/uartconfig");
+            url.searchParams.append("stop", "1");
+            fetch(url)
+                .then(response => response.text())
+                .then(data => {
+                    console.log(data);
+                    log("uart stop:" + data);
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    log("uart stop failed:", error)
+                });
+        };
+    }
+
+    function requestData() {
+        if (isProcessing) return;  // Skip if the previous task is still running
+        isProcessing = true;
+        try {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                const message = "RequestData";
+                socket.send(message);
+                //log("Sent: " + message);
+            }
+        } finally {
+            isProcessing = false;
+        }
+    }
+
+    function disconnect() {
+        if (intervalId) {
+            clearInterval(intervalId);
+            isProcessing = false;
+        }
+
+        if (socket) {
+            socket.close();
+        }
+    }
+
+    function blobToBinaryArray(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = function (event) {
+                const arrayBuffer = event.target.result;
+                const uint8Array = new Uint8Array(arrayBuffer);
+                resolve(uint8Array);
+            };
+
+            reader.onerror = function (event) {
+                reject(event.target.error);
+            };
+
+            reader.readAsArrayBuffer(blob);
+        });
+    }
+
+    function log(message) {
+        const messagesDiv = document.getElementById("messages");
+        const messageElement = document.createElement("div");
+
+        let date = new Date();
+        let datePrefix = date.getHours().toString().padStart(2, '0') + ":"
+            + date.getMinutes().toString().padStart(2, '0') + ":"
+            + date.getSeconds().toString().padStart(2, '0') + "."
+            + date.getMilliseconds().toString().padStart(3, '0');
+
+        messageElement.textContent = datePrefix + "  " + message;
+        messagesDiv.appendChild(messageElement);
+
+        messagesDiv.scrollTop = messagesDiv.scrollHeight; // Scroll to bottom
+    }
+</script>
+</body>
+</html>
