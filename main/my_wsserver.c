@@ -60,8 +60,6 @@ struct uart_task_arg {
     int rx_io_num;
 };
 
-static TaskHandle_t uart_task_hdl2;
-
 static esp_err_t open_log_file() {
     uint16_t rndId = esp_random() % 1000;
     struct stat file_stat;
@@ -132,27 +130,7 @@ static void init_uart(void *args) {
     ESP_LOGI(TAG, "start uart, speed:%d tx:%d, rx:%d", arg->baud_rate, arg->tx_io_num, arg->rx_io_num);
 }
 
-static void uart_task2(void *args) {
-    // Configure a temporary buffer for the incoming data
-    uint8_t *data = (uint8_t *) malloc(BUF_SIZE);
-    uint32_t x = 0;
-
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        ((uint32_t *) data)[0] = x;
-        x++;
-        // Write data back to the UART
-        uart_write_bytes(UART_NUM_1, data, 8);
-        print_bytes(data, 8);
-    }
-}
-
 static void stop_uart_task() {
-    if (uart_task_hdl2) {
-        vTaskDelete(uart_task_hdl2);
-    }
-    uart_task_hdl2 = NULL;
-
     uart_driver_delete(UART_NUM_1);
 
     if (logfile_fd != NULL) {
@@ -173,9 +151,6 @@ static void start_uart_task(int baud_rate, int tx_io_num, int rx_io_num) {
 
     init_uart(arg);
     free(arg);
-
-    // for test
-    xTaskCreate(uart_task2, "uart_task2", 8192, NULL, 10, &uart_task_hdl2);
 }
 
 static esp_err_t ws_handler(httpd_req_t *req) {
