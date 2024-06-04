@@ -4,17 +4,12 @@
 
 #include "my_wsserver.h"
 
-#include <esp_wifi.h>
 #include <esp_event.h>
 #include <esp_log.h>
-#include <esp_system.h>
 #include <nvs_flash.h>
-#include <sys/param.h>
-#include "esp_netif.h"
-#include "esp_eth.h"
 #include "driver/uart.h"
-#include "driver/gpio.h"
 #include "my_file_server_common.h"
+#include "bike_common.h"
 
 #include <esp_http_server.h>
 #include <esp_check.h>
@@ -27,32 +22,18 @@ static const char *TAG = "ws_echo_server";
 static uint8_t uart_buff[BUF_SIZE] = {0};
 static char uart_log_buff[BUF_SIZE * 3] = {0};
 
-/* Type of Escape algorithms to be used */
-#define NGX_ESCAPE_URI            (0)
-#define NGX_ESCAPE_ARGS           (1)
-#define NGX_ESCAPE_URI_COMPONENT  (2)
-#define NGX_ESCAPE_HTML           (3)
-#define NGX_ESCAPE_REFRESH        (4)
-#define NGX_ESCAPE_MEMCACHED      (5)
-#define NGX_ESCAPE_MAIL_AUTH      (6)
-
-/* Type of Unescape algorithms to be used */
-#define NGX_UNESCAPE_URI          (1)
-#define NGX_UNESCAPE_REDIRECT     (2)
+static int uart_buff_len = 0;
+static int valid_uart_buff_len = 0;
+static int uart_buff_idx = 0;
+static int lst_uart_buff_idx = 0;
 
 #define MY_HTTP_QUERY_KEY_MAX_LEN (64)
 
 static char log_filepath[ESP_VFS_PATH_MAX + CONFIG_SPIFFS_OBJ_NAME_LEN];
 static FILE *logfile_fd = NULL;
-/*
- * Structure holding server handle
- * and internal socket fd in order
- * to use out of request send
- */
-struct async_resp_arg {
-    httpd_handle_t hd;
-    int fd;
-};
+
+static TaskHandle_t uart_task_hdl = NULL;
+static TaskHandle_t uart_test_task_hdl = NULL;
 
 struct uart_task_arg {
     int baud_rate;
@@ -96,17 +77,7 @@ static esp_err_t open_log_file() {
     return ESP_OK;
 }
 
-void print_bytes(const uint8_t *bytes, int len) {
-    int i;
-
-    for (i = 0; i < len; i++) {
-        printf("%s0x%02x", i != 0 ? ":" : "", bytes[i]);
-    }
-
-    printf("\n");
-}
-
-static void init_uart(void *args) {
+static void uart_task(void *args) {
     struct uart_task_arg *arg = args;
     /* Configure parameters of an UART driver,
      * communication pins and install the driver */
@@ -128,10 +99,73 @@ static void init_uart(void *args) {
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, arg->tx_io_num, arg->rx_io_num, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_LOGI(TAG, "start uart, speed:%d tx:%d, rx:%d", arg->baud_rate, arg->tx_io_num, arg->rx_io_num);
+
+    while (1) {
+        // Read data from the UART
+        uart_buff_len = uart_read_bytes(UART_NUM_1, uart_buff, (BUF_SIZE - 1), 10 / portTICK_PERIOD_MS);
+        // Write data back to the UART
+        if (uart_buff_len > 0) {
+
+            valid_uart_buff_len = uart_buff_len;
+            uart_buff_idx ++;
+
+            print_bytes(uart_buff, uart_buff_len);
+
+            if (logfile_fd == NULL) {
+                open_log_file();
+            }
+
+            if (logfile_fd != NULL) {
+                //fwrite(uart_buff, 1, len + 1, logfile_fd);
+                int i;
+
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+
+                struct tm *timeinfo;
+                timeinfo = localtime(&tv.tv_sec);
+
+                sprintf(uart_log_buff, "\n%02d:%02d:%02d.%03ld: ", timeinfo->tm_hour, timeinfo->tm_min,
+                        timeinfo->tm_sec,
+                        tv.tv_usec / 1000);
+                int start_idx = strlen(uart_log_buff) - 1;
+                for (i = 0; i < uart_buff_len; i++) {
+                    sprintf(uart_log_buff + start_idx, "%s%02x", i != 0 ? " " : "", uart_buff[i]);
+                    start_idx += (i != 0 ? 3 : 2);
+                }
+
+                fwrite(uart_log_buff, sizeof(uart_log_buff[0]), strlen(uart_log_buff), logfile_fd);
+            }
+        }
+    }
+}
+
+static void uart_test_write_task(void *args) {
+    // Configure a temporary buffer for the incoming data
+    uint8_t *data = (uint8_t *) malloc(12);
+    uint32_t x = 0;
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        ((uint32_t *) data)[0] = x;
+        x++;
+        // Write data back to the UART
+        uart_write_bytes(UART_NUM_1, data, 8);
+        print_bytes(data, 8);
+    }
 }
 
 static void stop_uart_task() {
-    uart_driver_delete(UART_NUM_1);
+    if (uart_test_task_hdl) {
+        vTaskDelete(uart_test_task_hdl);
+    }
+    uart_test_task_hdl = NULL;
+
+    if (uart_task_hdl != NULL) {
+        vTaskDelete(uart_task_hdl);
+        uart_task_hdl = NULL;
+        uart_driver_delete(UART_NUM_1);
+    }
 
     if (logfile_fd != NULL) {
         fclose(logfile_fd);
@@ -141,16 +175,15 @@ static void stop_uart_task() {
 
 static void start_uart_task(int baud_rate, int tx_io_num, int rx_io_num) {
     stop_uart_task();
-
-    open_log_file();
-
     struct uart_task_arg *arg = malloc(sizeof(struct uart_task_arg));
     arg->baud_rate = baud_rate;
     arg->rx_io_num = rx_io_num;
     arg->tx_io_num = tx_io_num;
-
-    init_uart(arg);
+    xTaskCreate(uart_task, "uart_task", 8192, arg, 5, &uart_task_hdl);
     free(arg);
+
+    // for test
+    // xTaskCreate(uart_test_write_task, "uart_test_task", 8192, NULL, 10, &uart_test_task_hdl);
 }
 
 static esp_err_t ws_handler(httpd_req_t *req) {
@@ -168,6 +201,7 @@ static esp_err_t ws_handler(httpd_req_t *req) {
         ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame len with %d", ret);
         return ret;
     }
+
     if (ws_pkt.len) {
         /* ws_pkt.len + 1 is for NULL termination as we are expecting a string */
         buf = calloc(1, ws_pkt.len + 1);
@@ -187,51 +221,20 @@ static esp_err_t ws_handler(httpd_req_t *req) {
         ESP_LOGI(TAG, "frame len is %d, packet type: %d message:%s", ws_pkt.len, ws_pkt.type, ws_pkt.payload);
     }
 
-#ifdef USE_ASYNC_SEND
-    if (ws_pkt.type == HTTPD_WS_TYPE_TEXT &&
-        strcmp((char *) ws_pkt.payload, "Trigger async") == 0) {
-        free(buf);
-        return trigger_async_send(req->handle, req);
-    }
-#endif
+    if (lst_uart_buff_idx != uart_buff_idx) {
+        lst_uart_buff_idx = uart_buff_idx;
 
-    int len;
-    do {
-        len = uart_read_bytes(UART_NUM_1, uart_buff, (BUF_SIZE - 1), 20 / portTICK_PERIOD_MS);
-        if (len) {
-            memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
-            ws_pkt.type = HTTPD_WS_TYPE_BINARY;
-            ws_pkt.payload = uart_buff;
-            ws_pkt.len = len;
+        // new data come
+        memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+        ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+        ws_pkt.payload = uart_buff;
+        ws_pkt.len = valid_uart_buff_len;
 
-            print_bytes(uart_buff, len);
-
-            if (logfile_fd != NULL) {
-                //fwrite(uart_buff, 1, len + 1, logfile_fd);
-                int i;
-
-                struct timeval tv;
-                gettimeofday(&tv, NULL);
-
-                struct tm *timeinfo;
-                timeinfo = localtime(&tv.tv_sec);
-
-                sprintf(uart_log_buff, "\n%02d:%02d:%02d.%03ld: ", timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec,
-                        tv.tv_usec / 1000);
-                fwrite(uart_log_buff, sizeof(uart_log_buff[0]), strlen(uart_log_buff), logfile_fd);
-
-                for (i = 0; i < len; i++) {
-                    sprintf(uart_log_buff, "%s%02x", i != 0 ? " " : "", uart_buff[i]);
-                    fwrite(uart_log_buff, sizeof(uart_log_buff[0]), strlen(uart_log_buff), logfile_fd);
-                }
-            }
-
-            ret = httpd_ws_send_frame(req, &ws_pkt);
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "httpd_ws_send_frame failed with %d", ret);
-            }
+        ret = httpd_ws_send_frame(req, &ws_pkt);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "httpd_ws_send_frame failed with %d", ret);
         }
-    } while (len > 0);
+    }
 
     free(buf);
     return ret;
@@ -254,148 +257,7 @@ static esp_err_t ws_uart_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-void ngx_unescape_uri(u_char **dst, u_char **src, size_t size, unsigned int type) {
-    u_char *d, *s, ch, c, decoded;
-    enum {
-        sw_usual = 0,
-        sw_quoted,
-        sw_quoted_second
-    } state;
-
-    d = *dst;
-    s = *src;
-
-    state = 0;
-    decoded = 0;
-
-    while (size--) {
-
-        ch = *s++;
-
-        switch (state) {
-            case sw_usual:
-                if (ch == '?'
-                    && (type & (NGX_UNESCAPE_URI | NGX_UNESCAPE_REDIRECT))) {
-                    *d++ = ch;
-                    goto done;
-                }
-
-                if (ch == '%') {
-                    state = sw_quoted;
-                    break;
-                }
-
-                *d++ = ch;
-                break;
-
-            case sw_quoted:
-
-                if (ch >= '0' && ch <= '9') {
-                    decoded = (u_char) (ch - '0');
-                    state = sw_quoted_second;
-                    break;
-                }
-
-                c = (u_char) (ch | 0x20);
-                if (c >= 'a' && c <= 'f') {
-                    decoded = (u_char) (c - 'a' + 10);
-                    state = sw_quoted_second;
-                    break;
-                }
-
-                /* the invalid quoted character */
-
-                state = sw_usual;
-
-                *d++ = ch;
-
-                break;
-
-            case sw_quoted_second:
-
-                state = sw_usual;
-
-                if (ch >= '0' && ch <= '9') {
-                    ch = (u_char) ((decoded << 4) + (ch - '0'));
-
-                    if (type & NGX_UNESCAPE_REDIRECT) {
-                        if (ch > '%' && ch < 0x7f) {
-                            *d++ = ch;
-                            break;
-                        }
-
-                        *d++ = '%';
-                        *d++ = *(s - 2);
-                        *d++ = *(s - 1);
-
-                        break;
-                    }
-
-                    *d++ = ch;
-
-                    break;
-                }
-
-                c = (u_char) (ch | 0x20);
-                if (c >= 'a' && c <= 'f') {
-                    ch = (u_char) ((decoded << 4) + (c - 'a') + 10);
-
-                    if (type & NGX_UNESCAPE_URI) {
-                        if (ch == '?') {
-                            *d++ = ch;
-                            goto done;
-                        }
-
-                        *d++ = ch;
-                        break;
-                    }
-
-                    if (type & NGX_UNESCAPE_REDIRECT) {
-                        if (ch == '?') {
-                            *d++ = ch;
-                            goto done;
-                        }
-
-                        if (ch > '%' && ch < 0x7f) {
-                            *d++ = ch;
-                            break;
-                        }
-
-                        *d++ = '%';
-                        *d++ = *(s - 2);
-                        *d++ = *(s - 1);
-                        break;
-                    }
-
-                    *d++ = ch;
-
-                    break;
-                }
-
-                /* the invalid quoted character */
-
-                break;
-        }
-    }
-
-    done:
-
-    *dst = d;
-    *src = s;
-}
-
-static void uri_decode(char *dest, const char *src, size_t len) {
-    if (!src || !dest) {
-        return;
-    }
-
-    unsigned char *src_ptr = (unsigned char *) src;
-    unsigned char *dst_ptr = (unsigned char *) dest;
-    ngx_unescape_uri(&dst_ptr, &src_ptr, len, NGX_UNESCAPE_URI);
-}
-
 esp_err_t ws_uart_config_handler(httpd_req_t *req) {
-
     char *buf;
     size_t buf_len;
     int speed = 9600;

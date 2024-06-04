@@ -21,4 +21,8 @@
 
 esp_err_t common_init_nvs();
 
+void uri_decode(char *dest, const char *src, size_t len);
+
+void print_bytes(const uint8_t *bytes, int len);
+
 #endif
